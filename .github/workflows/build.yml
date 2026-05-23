@@ -38,7 +38,7 @@ jobs:
           python-version: '3.11'
 
       - name: Build
-        run: build.bat
+        run: cmd /c build.bat
 
       - uses: actions/upload-artifact@v4
         with:
