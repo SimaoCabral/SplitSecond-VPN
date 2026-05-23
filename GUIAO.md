@@ -18,7 +18,7 @@
 
 ### O que vais precisar
 
-- O ficheiro **`splitsecond-vpn.exe`** (o organizador partilha o link para descarregar)
+- O ficheiro **`splitsecond-vpn.exe`** — descarrega em [github.com/SimaoCabral/SplitSecond-VPN/releases/latest](https://github.com/SimaoCabral/SplitSecond-VPN/releases/latest)
 - O conteúdo do ficheiro **`hosts/server`** (o organizador envia-te por Discord, WhatsApp, etc.)
 - Um **número de IP** atribuído pelo organizador (por exemplo: `2`, `3`, `4`…)
 
@@ -26,7 +26,7 @@
 
 ### Passo 1 — Descarregar e abrir o programa
 
-1. Descarrega o ficheiro `splitsecond-vpn.exe` a partir do link que o organizador partilhou.
+1. Descarrega o ficheiro `splitsecond-vpn.exe` em [github.com/SimaoCabral/SplitSecond-VPN/releases/latest](https://github.com/SimaoCabral/SplitSecond-VPN/releases/latest).
 2. Faz **duplo-clique** no ficheiro.
 3. Aparece uma janela do Windows a perguntar se permites que o programa faça alterações — clica **Sim**. Isto é necessário porque o programa precisa de instalar software de rede.
 
@@ -115,7 +115,7 @@ O programa mostra o **Passo 6 — Ligar à VPN**.
 
 ### O que vais precisar
 
-- O ficheiro **`splitsecond-vpn`** (o organizador partilha o link para descarregar)
+- O ficheiro **`splitsecond-vpn`** — descarrega em [github.com/SimaoCabral/SplitSecond-VPN/releases/latest](https://github.com/SimaoCabral/SplitSecond-VPN/releases/latest)
 - O conteúdo do ficheiro **`hosts/server`** (o organizador envia por Discord, WhatsApp, etc.)
 - Um **número de IP** atribuído pelo organizador (por exemplo: `2`, `3`, `4`…)
 
@@ -123,7 +123,7 @@ O programa mostra o **Passo 6 — Ligar à VPN**.
 
 ### Passo 1 — Descarregar e preparar o programa
 
-1. Descarrega o ficheiro `splitsecond-vpn` a partir do link que o organizador partilhou.
+1. Descarrega o ficheiro `splitsecond-vpn` em [github.com/SimaoCabral/SplitSecond-VPN/releases/latest](https://github.com/SimaoCabral/SplitSecond-VPN/releases/latest).
 2. Abre a pasta onde ficou guardado (normalmente a pasta **Transferências**).
 3. Clica com o botão **direito** no ficheiro → **Propriedades** → separador **Permissões** → activa a opção **"Permitir executar o ficheiro como programa"** (ou similar, depende do ambiente de trabalho).
    - Em alternativa, se estiveres confortável com um terminal: `chmod +x splitsecond-vpn`
