@@ -1455,7 +1455,33 @@ class App(ctk.CTk):
 def main() -> int:
     if IS_WINDOWS and not is_admin():
         reexec_as_admin_windows()
-    app = App()
+
+    # Em Linux/Wayland, $DISPLAY pode não existir; tkinter precisa dele.
+    if IS_LINUX and not os.environ.get("DISPLAY"):
+        wl = os.environ.get("WAYLAND_DISPLAY", "")
+        if wl:
+            os.environ["DISPLAY"] = ":0"
+        else:
+            print("Erro: nenhum display gráfico detectado ($DISPLAY / $WAYLAND_DISPLAY).",
+                  file=sys.stderr)
+            print("Executa o programa a partir de uma sessão gráfica (não uses sudo directamente).",
+                  file=sys.stderr)
+            return 1
+
+    try:
+        app = App()
+    except Exception as e:
+        if "display" in str(e).lower() or "DISPLAY" in str(e):
+            print("Erro: não foi possível ligar ao servidor gráfico.", file=sys.stderr)
+            print("", file=sys.stderr)
+            if os.environ.get("WAYLAND_DISPLAY"):
+                print("Estás numa sessão Wayland sem XWayland disponível.", file=sys.stderr)
+                print("Instala o XWayland (ex: 'sudo dnf install xorg-x11-server-Xwayland')", file=sys.stderr)
+                print("ou, no Bazzite: 'rpm-ostree install xorg-x11-server-Xwayland' e reinicia.", file=sys.stderr)
+            else:
+                print("Certifica-te de que estás numa sessão gráfica e não usas sudo.", file=sys.stderr)
+            return 1
+        raise
     app.mainloop()
     return 0
 
