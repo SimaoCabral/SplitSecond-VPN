@@ -179,11 +179,26 @@ def tinc_installed() -> bool:
 
 
 def tinc_status() -> bool:
-    if IS_WINDOWS:
-        rc, out, _ = run_cmd(["tasklist", "/FI", "IMAGENAME eq tincd.exe"], timeout=10)
-        return rc == 0 and "tincd.exe" in out.lower()
-    rc, out, _ = run_cmd(["pgrep", "-a", "tincd"], timeout=5)
-    return rc == 0 and NETWORK_NAME in out
+    try:
+        if IS_WINDOWS:
+            # Verificar se o processo tincd.exe está em execução
+            rc, out, _ = run_cmd(["tasklist", "/FI", "IMAGENAME eq tincd.exe"], timeout=10)
+            if rc == 0 and "tincd.exe" in out.lower():
+                return True
+            # Fallback: verificar se a interface TAP tem IP configurado
+            rc2, out2, _ = run_cmd(["netsh", "interface", "ip", "show", "config"], timeout=10)
+            if rc2 == 0 and "10.20.0." in out2:
+                return True
+            return False
+        # Linux: verificar processo tincd
+        rc, out, _ = run_cmd(["pgrep", "-a", "tincd"], timeout=5)
+        if rc == 0 and NETWORK_NAME in out:
+            return True
+        # Fallback: verificar interface VPN
+        rc2, out2, _ = run_cmd(["ip", "addr", "show", NETWORK_NAME], timeout=5)
+        return rc2 == 0 and "10.20.0." in out2
+    except Exception:
+        return False
 
 
 def ensure_tinc_dirs() -> None:
@@ -389,10 +404,19 @@ def check_tap_installed() -> bool:
     """Windows: True se o adaptador tap0901 existir."""
     if not IS_WINDOWS:
         return True
-    rc, _, _ = run_cmd(
-        ["netsh", "interface", "show", "interface", "name=tap0901"], timeout=5
-    )
-    return rc == 0
+    try:
+        # Listar todas as interfaces e procurar por "tap" no output
+        rc, out, _ = run_cmd(
+            ["netsh", "interface", "show", "interface"], timeout=10
+        )
+        if rc != 0:
+            return False
+        for line in out.splitlines():
+            if "tap" in line.lower():
+                return True
+        return False
+    except Exception:
+        return False
 
 
 def step_config_done(player_name: str, setup_done_flag: bool = False) -> bool:
@@ -674,13 +698,16 @@ class App(ctk.CTk):
                 item["frame"].configure(fg_color="transparent")
 
     def _is_step_complete(self, step_id: str) -> bool:
-        if step_id == "tinc":     return tinc_installed()
-        if step_id == "tap":      return check_tap_installed()
-        if step_id == "config":   return step_config_done(
-            self.settings.player_name, self.settings.setup_done)
-        if step_id == "server":   return step_server_done()
-        if step_id == "hostfile": return self.settings.host_file_sent
-        if step_id == "connect":  return self._connected_state
+        try:
+            if step_id == "tinc":     return tinc_installed()
+            if step_id == "tap":      return check_tap_installed()
+            if step_id == "config":   return step_config_done(
+                self.settings.player_name, self.settings.setup_done)
+            if step_id == "server":   return step_server_done()
+            if step_id == "hostfile": return self.settings.host_file_sent
+            if step_id == "connect":  return self._connected_state
+        except Exception:
+            pass
         return False
 
     # ------------------------------------------------------------------ step frames
@@ -840,11 +867,15 @@ class App(ctk.CTk):
 
     def _refresh_tap_step(self) -> None:
         def worker() -> None:
-            ok = check_tap_installed()
-            msg = "✓  Adaptador 'tap0901' encontrado." if ok else "✗  Adaptador 'tap0901' não encontrado."
-            color = OK_COLOR if ok else BAD_COLOR
-            self.after(0, lambda: self.tap_status_lbl.configure(text=msg, text_color=color))
-            self.after(0, self._update_sidebar)
+            try:
+                ok = check_tap_installed()
+                msg = "✓  Adaptador TAP encontrado." if ok else "✗  Adaptador TAP não encontrado."
+                color = OK_COLOR if ok else BAD_COLOR
+                self.after(0, lambda: self.tap_status_lbl.configure(text=msg, text_color=color))
+                self.after(0, self._update_sidebar)
+            except Exception as e:
+                self.after(0, lambda: self.tap_status_lbl.configure(
+                    text=f"Erro ao verificar TAP: {e}", text_color=BAD_COLOR))
         threading.Thread(target=worker, daemon=True).start()
 
     # ---- Step 3 — Configurar jogador ----
@@ -1181,12 +1212,15 @@ class App(ctk.CTk):
 
     def _refresh_status_async(self) -> None:
         def worker() -> None:
-            connected = tinc_status()
-            self.after(0, lambda: self._set_connected(connected))
-            if connected and hasattr(self, "ping_label"):
-                ok = ping_server()
-                self.after(0, lambda: self.ping_label.configure(
-                    text=f"Ping ao servidor: {'OK ✓' if ok else 'sem resposta ✗'}"))
+            try:
+                connected = tinc_status()
+                self.after(0, lambda: self._set_connected(connected))
+                if connected and hasattr(self, "ping_label"):
+                    ok = ping_server()
+                    self.after(0, lambda: self.ping_label.configure(
+                        text=f"Ping ao servidor: {'OK ✓' if ok else 'sem resposta ✗'}"))
+            except Exception:
+                pass
         threading.Thread(target=worker, daemon=True).start()
 
     def _populate_my_host(self, content: str) -> None:
@@ -1301,12 +1335,15 @@ class App(ctk.CTk):
 
     def on_install_tap(self) -> None:
         def worker() -> None:
-            self.after(0, lambda: self._log("A instalar driver TAP…"))
-            ok, msg = install_tap_driver()
-            if msg:
-                self.after(0, lambda m=msg: self._log(m))
-            self.after(0, lambda: self._log("Driver TAP instalado." if ok else "⚠  Falha — vê o log."))
-            self.after(0, self._refresh_tap_step)
+            try:
+                self.after(0, lambda: self._log("A instalar driver TAP…"))
+                ok, msg = install_tap_driver()
+                if msg:
+                    self.after(0, lambda m=msg: self._log(m))
+                self.after(0, lambda: self._log("Driver TAP instalado." if ok else "⚠  Falha — vê o log."))
+                self.after(0, self._refresh_tap_step)
+            except Exception as e:
+                self.after(0, lambda e=e: self._log(f"Erro ao instalar TAP: {e}"))
         threading.Thread(target=worker, daemon=True).start()
 
     def on_firewall(self) -> None:
