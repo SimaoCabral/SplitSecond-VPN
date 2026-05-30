@@ -181,22 +181,11 @@ def tinc_installed() -> bool:
 def tinc_status() -> bool:
     try:
         if IS_WINDOWS:
-            # Verificar se o processo tincd.exe está em execução
-            rc, out, _ = run_cmd(["tasklist", "/FI", "IMAGENAME eq tincd.exe"], timeout=10)
-            if rc == 0 and "tincd.exe" in out.lower():
-                return True
-            # Fallback: verificar se a interface TAP tem IP configurado
-            rc2, out2, _ = run_cmd(["netsh", "interface", "ip", "show", "config"], timeout=10)
-            if rc2 == 0 and "10.20.0." in out2:
-                return True
-            return False
-        # Linux: verificar processo tincd
+            rc, out, _ = run_cmd(["tasklist", "/FI", "IMAGENAME eq tincd.exe",
+                                  "/NH"], timeout=10)
+            return rc == 0 and "tincd.exe" in out.lower()
         rc, out, _ = run_cmd(["pgrep", "-a", "tincd"], timeout=5)
-        if rc == 0 and NETWORK_NAME in out:
-            return True
-        # Fallback: verificar interface VPN
-        rc2, out2, _ = run_cmd(["ip", "addr", "show", NETWORK_NAME], timeout=5)
-        return rc2 == 0 and "10.20.0." in out2
+        return rc == 0 and NETWORK_NAME in out
     except Exception:
         return False
 
