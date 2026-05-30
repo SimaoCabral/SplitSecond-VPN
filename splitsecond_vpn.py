@@ -6,6 +6,7 @@ e navegação livre. Cross-platform (Windows + Linux).
 
 from __future__ import annotations
 
+import csv
 import ctypes
 import json
 import os
@@ -26,13 +27,14 @@ import customtkinter as ctk
 
 
 NETWORK_NAME = "splitsecond"
+WINDOWS_SERVICE_NAME = f"tinc.{NETWORK_NAME}"  # nome do serviço criado por 'tinc start'
 SERVER_VPN_IP = "10.20.0.1"
 VPN_SUBNET_MASK = "255.255.255.0"
 VPN_CIDR_BITS = 24
 TINC_PORT = 11655
 
 APP_TITLE = "Split/Second VPN"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.3"
 
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX = platform.system() == "Linux"
@@ -181,9 +183,11 @@ def tinc_installed() -> bool:
 def tinc_status() -> bool:
     try:
         if IS_WINDOWS:
-            rc, out, _ = run_cmd(["tasklist", "/FI", "IMAGENAME eq tincd.exe",
-                                  "/NH"], timeout=10)
-            return rc == 0 and "tincd.exe" in out.lower()
+            # Específico da nossa rede: o 'tinc start' regista um serviço
+            # chamado tinc.<rede>. Verificar 'tincd.exe' genérico dava falsos
+            # positivos quando havia outro tincd ou um serviço deixado a correr.
+            rc, out, _ = run_cmd(["sc", "query", WINDOWS_SERVICE_NAME], timeout=10)
+            return rc == 0 and "RUNNING" in out.upper()
         rc, out, _ = run_cmd(["pgrep", "-a", "tincd"], timeout=5)
         return rc == 0 and NETWORK_NAME in out
     except Exception:
@@ -290,6 +294,10 @@ def read_self_host_file(player_name: str) -> str:
 def start_tinc() -> tuple[bool, str]:
     if IS_WINDOWS:
         rc, out, err = run_cmd([tinc_binary(), "-n", NETWORK_NAME, "start"], timeout=20)
+        if rc == 0:
+            # 'tinc start' regista o serviço como arranque automático; passá-lo a
+            # manual para que um reboot não reconecte sozinho (e mostre "ligado").
+            run_cmd(["sc", "config", WINDOWS_SERVICE_NAME, "start=", "demand"], timeout=10)
         return rc == 0, (out + err).strip()
     sp = sudo_prefix()
     rc, out, err = run_cmd(sp + [tincd_binary(), "-n", NETWORK_NAME], timeout=20)
@@ -298,21 +306,61 @@ def start_tinc() -> tuple[bool, str]:
 
 def stop_tinc() -> tuple[bool, str]:
     if IS_WINDOWS:
+        # Paragem graciosa via tinc (best-effort — pode faltar o tinc.exe), mas a
+        # remoção do serviço é o que garante que não volta a arrancar no boot.
         rc, out, err = run_cmd([tinc_binary(), "-n", NETWORK_NAME, "stop"], timeout=20)
-        return rc == 0, (out + err).strip()
+        run_cmd(["sc", "stop", WINDOWS_SERVICE_NAME], timeout=15)
+        run_cmd(["sc", "delete", WINDOWS_SERVICE_NAME], timeout=15)
+        # Sucesso = o serviço já não está a correr (independente do tinc.exe).
+        return (not tinc_status()), (out + err).strip()
     sp = sudo_prefix()
     rc, out, err = run_cmd(sp + ["pkill", "-f", f"tincd.*{NETWORK_NAME}"], timeout=10)
     return rc in (0, 1), (out + err).strip()
 
 
+def find_windows_tap_name() -> str:
+    """Nome da ligação do adaptador TAP-Windows (ex.: 'Ethernet 2'), ou '' se não existir.
+
+    O instalador do TAP cria o dispositivo 'tap0901' mas a *ligação* fica com um
+    nome automático ('Ethernet 2', etc.). Detectamos pela descrição do driver
+    ('TAP-Windows Adapter V9') em vez de assumir que se chama 'tap0901'.
+    """
+    if not IS_WINDOWS:
+        return ""
+    # getmac é nativo e rápido; a coluna 'Network Adapter' tem a descrição do driver.
+    rc, out, _ = run_cmd(["getmac", "/v", "/fo", "csv"], timeout=15)
+    if rc == 0 and out.strip():
+        try:
+            for row in csv.reader(out.splitlines()):
+                if len(row) >= 2 and "tap-win" in row[1].lower():
+                    return row[0].strip()
+        except Exception:
+            pass
+    # Fallback: Get-NetAdapter apanha também adaptadores desligados (sem media).
+    ps = ("Get-NetAdapter | Where-Object { $_.InterfaceDescription -like '*TAP-Win*' }"
+          " | Select-Object -First 1 -ExpandProperty Name")
+    rc, out, _ = run_cmd(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], timeout=20)
+    if rc == 0 and out.strip():
+        return out.strip().splitlines()[0].strip()
+    return ""
+
+
 def set_windows_tap_ip(ip: str) -> tuple[bool, str]:
     if not IS_WINDOWS:
         return True, ""
+    name = find_windows_tap_name()
+    if not name:
+        return False, ("Adaptador TAP não encontrado — instala o driver TAP (Passo 2) "
+                       "e tenta de novo.")
     rc, out, err = run_cmd(
-        ["netsh", "interface", "ip", "set", "address", "tap0901", "static", ip, VPN_SUBNET_MASK],
+        ["netsh", "interface", "ip", "set", "address", name, "static", ip, VPN_SUBNET_MASK],
         timeout=30,
     )
-    return rc == 0, (out + err).strip()
+    msg = (out + err).strip()
+    if rc != 0:
+        return False, msg or f"netsh falhou (código {rc}) ao configurar '{name}'."
+    return True, f"IP {ip} definido em '{name}'."
 
 
 def add_windows_firewall_rules() -> tuple[bool, str]:
@@ -390,20 +438,11 @@ def tinc_version() -> str:
 
 
 def check_tap_installed() -> bool:
-    """Windows: True se o adaptador tap0901 existir."""
+    """Windows: True se existir um adaptador TAP-Windows (independente do nome)."""
     if not IS_WINDOWS:
         return True
     try:
-        # Listar todas as interfaces e procurar por "tap" no output
-        rc, out, _ = run_cmd(
-            ["netsh", "interface", "show", "interface"], timeout=10
-        )
-        if rc != 0:
-            return False
-        for line in out.splitlines():
-            if "tap" in line.lower():
-                return True
-        return False
+        return bool(find_windows_tap_name())
     except Exception:
         return False
 
