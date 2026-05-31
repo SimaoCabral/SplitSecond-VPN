@@ -34,7 +34,7 @@ VPN_CIDR_BITS = 24
 TINC_PORT = 11655
 
 APP_TITLE = "Split/Second VPN"
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.4"
 
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX = platform.system() == "Linux"
@@ -291,8 +291,27 @@ def read_self_host_file(player_name: str) -> str:
 
 # ----------------------------- connect / disconnect -----------------------------
 
+def _windows_force_stop() -> str:
+    """Pára tudo de forma idempotente: serviço + qualquer tincd órfão.
+
+    Devolve a saída relevante do 'tinc stop' (para log). Mata tincd.exe por
+    nome porque um daemon arrancado à mão (fora do serviço) não é parado por
+    'sc stop' e fica a correr config antiga — a causa do 'já está a correr'.
+    """
+    rc, out, err = run_cmd([tinc_binary(), "-n", NETWORK_NAME, "stop"], timeout=20)
+    run_cmd(["sc", "stop", WINDOWS_SERVICE_NAME], timeout=15)
+    run_cmd(["sc", "delete", WINDOWS_SERVICE_NAME], timeout=15)
+    run_cmd(["taskkill", "/F", "/IM", "tincd.exe"], timeout=15)
+    return (out + err).strip()
+
+
 def start_tinc() -> tuple[bool, str]:
     if IS_WINDOWS:
+        # Arranque limpo. Um tincd já a correr ignora alterações recentes à
+        # config (Address do servidor, novos host files) — 'tinc start' apenas
+        # diz "já está a correr". Paramos primeiro para garantir que recarrega.
+        _windows_force_stop()
+        time.sleep(1)  # sc delete é assíncrono; evita "marked for deletion"
         rc, out, err = run_cmd([tinc_binary(), "-n", NETWORK_NAME, "start"], timeout=20)
         if rc == 0:
             # 'tinc start' regista o serviço como arranque automático; passá-lo a
@@ -300,19 +319,18 @@ def start_tinc() -> tuple[bool, str]:
             run_cmd(["sc", "config", WINDOWS_SERVICE_NAME, "start=", "demand"], timeout=10)
         return rc == 0, (out + err).strip()
     sp = sudo_prefix()
+    # Linux: também arranque limpo, para recarregar config/host files novos.
+    run_cmd(sp + ["pkill", "-f", f"tincd.*{NETWORK_NAME}"], timeout=10)
     rc, out, err = run_cmd(sp + [tincd_binary(), "-n", NETWORK_NAME], timeout=20)
     return rc == 0, (out + err).strip()
 
 
 def stop_tinc() -> tuple[bool, str]:
     if IS_WINDOWS:
-        # Paragem graciosa via tinc (best-effort — pode faltar o tinc.exe), mas a
-        # remoção do serviço é o que garante que não volta a arrancar no boot.
-        rc, out, err = run_cmd([tinc_binary(), "-n", NETWORK_NAME, "stop"], timeout=20)
-        run_cmd(["sc", "stop", WINDOWS_SERVICE_NAME], timeout=15)
-        run_cmd(["sc", "delete", WINDOWS_SERVICE_NAME], timeout=15)
+        # Paragem graciosa via tinc + remoção do serviço + tincd órfão.
+        log = _windows_force_stop()
         # Sucesso = o serviço já não está a correr (independente do tinc.exe).
-        return (not tinc_status()), (out + err).strip()
+        return (not tinc_status()), log
     sp = sudo_prefix()
     rc, out, err = run_cmd(sp + ["pkill", "-f", f"tincd.*{NETWORK_NAME}"], timeout=10)
     return rc in (0, 1), (out + err).strip()
@@ -363,21 +381,46 @@ def set_windows_tap_ip(ip: str) -> tuple[bool, str]:
     return True, f"IP {ip} definido em '{name}'."
 
 
+# (nome da regra, spec extra). dir=in/action=allow são comuns a todas.
+_FIREWALL_RULES: list[tuple[str, list[str]]] = [
+    ("tinc-tcp", ["protocol=TCP", f"localport={TINC_PORT}"]),
+    ("tinc-udp", ["protocol=UDP", f"localport={TINC_PORT}"]),
+    ("ICMP-Allow", ["protocol=icmpv4:8,any"]),
+    # Tráfego do jogo: a TAP é classificada como rede 'Pública' e o Windows
+    # bloqueia tudo o que entra. Permitir a sub-rede VPN deixa passar a
+    # descoberta LAN do Split/Second (broadcast UDP 9100) e o resto.
+    ("splitsecond-vpn", ["remoteip=10.20.0.0/24"]),
+]
+
+
+def windows_firewall_rules_present() -> bool:
+    """True se todas as nossas regras de firewall já existem."""
+    if not IS_WINDOWS:
+        return True
+    for name, _ in _FIREWALL_RULES:
+        # 'show rule' devolve código != 0 com "No rules match..." se não existir.
+        rc, _, _ = run_cmd(
+            ["netsh", "advfirewall", "firewall", "show", "rule", f"name={name}"],
+            timeout=10)
+        if rc != 0:
+            return False
+    return True
+
+
 def add_windows_firewall_rules() -> tuple[bool, str]:
     if not IS_WINDOWS:
         return True, ""
     log: list[str] = []
-    rules = [
-        ["netsh", "advfirewall", "firewall", "add", "rule", "name=tinc-tcp", "dir=in",
-         "action=allow", "protocol=TCP", f"localport={TINC_PORT}"],
-        ["netsh", "advfirewall", "firewall", "add", "rule", "name=tinc-udp", "dir=in",
-         "action=allow", "protocol=UDP", f"localport={TINC_PORT}"],
-        ["netsh", "advfirewall", "firewall", "add", "rule", "name=ICMP-Allow",
-         "protocol=icmpv4:8,any", "dir=in", "action=allow"],
-    ]
     all_ok = True
-    for cmd in rules:
-        rc, out, err = run_cmd(cmd, timeout=15)
+    for name, spec in _FIREWALL_RULES:
+        # Idempotente: apagar primeiro qualquer regra com este nome, senão o
+        # netsh acumula um duplicado a cada execução.
+        run_cmd(["netsh", "advfirewall", "firewall", "delete", "rule", f"name={name}"],
+                timeout=15)
+        rc, out, err = run_cmd(
+            ["netsh", "advfirewall", "firewall", "add", "rule", f"name={name}",
+             "dir=in", "action=allow"] + spec,
+            timeout=15)
         if rc != 0:
             all_ok = False
         log.append((out + err).strip())
@@ -391,6 +434,28 @@ def ping_server(timeout_s: int = 2) -> bool:
         cmd = ["ping", "-c", "1", "-W", str(timeout_s), SERVER_VPN_IP]
     rc, _, _ = run_cmd(cmd, timeout=timeout_s + 3)
     return rc == 0
+
+
+def tinc_diagnostics() -> str:
+    """Interroga o tincd em execução sobre o estado da ligação ao servidor.
+
+    O serviço pode estar 'a correr' sem qualquer túnel estabelecido (servidor
+    inalcançável, chaves trocadas, porta bloqueada). Estes comandos de controlo
+    do tinc 1.1 mostram a razão real — é o que faltava ao log.
+    """
+    base = [] if IS_WINDOWS else sudo_prefix()
+    tb = tinc_binary()
+    out_lines: list[str] = []
+    for label, args in (
+        ("info server", ["info", "server"]),
+        ("nodes", ["dump", "nodes"]),
+        ("edges", ["dump", "edges"]),
+    ):
+        rc, out, err = run_cmd(base + [tb, "-n", NETWORK_NAME] + args, timeout=10)
+        txt = (out or err).strip()
+        out_lines.append(f"── tinc {label} ──")
+        out_lines.append(txt if txt else "(sem resposta — o tincd está mesmo a correr?)")
+    return "\n".join(out_lines)
 
 
 # ----------------------------- host file helpers -----------------------------
@@ -582,6 +647,7 @@ class App(ctk.CTk):
         self._connected_state: bool = False
         self._step_frames: dict[str, ctk.CTkScrollableFrame] = {}
         self._sidebar_items: list[dict] = []
+        self._guards: list = []  # refresh callbacks dos botões "feito → bloqueado"
 
         self._build_ui()
         self._log(f"{APP_TITLE} {APP_VERSION} — {platform.system()} {platform.release()}")
@@ -766,6 +832,55 @@ class App(ctk.CTk):
         f.pack(fill="x", padx=28, pady=8)
         return f
 
+    def _make_guarded(self, parent: ctk.CTkBaseClass, *, text: str,
+                      done_predicate, command, width=None, height=None,
+                      font=None, fg_color: str = ACCENT,
+                      hover_color: str = ACCENT_HOVER) -> ctk.CTkFrame:
+        """Botão cuja acção fica indisponível quando já está feita.
+
+        Se 'done_predicate()' for verdadeiro, o botão aparece desactivado com um
+        ✓; surge uma caixa 'Forçar' que, marcada, o reactiva para repetir a acção
+        de propósito (ex.: regenerar chaves, reinstalar o driver)."""
+        wrap = ctk.CTkFrame(parent, fg_color="transparent")
+        kw = dict(text=text, fg_color=fg_color, hover_color=hover_color, command=command)
+        if width:
+            kw["width"] = width
+        if height:
+            kw["height"] = height
+        if font:
+            kw["font"] = font
+        btn = ctk.CTkButton(wrap, **kw)
+        btn.pack(side="left", padx=(0, 8))
+        chk = ctk.CTkCheckBox(wrap, text="Forçar", font=ctk.CTkFont(size=11), width=20)
+
+        def refresh() -> None:
+            try:
+                done = bool(done_predicate())
+            except Exception:
+                done = False
+            if not done:
+                chk.deselect()
+                chk.pack_forget()
+                btn.configure(state="normal", text=text)
+                return
+            chk.pack(side="left")  # já está feito → oferecer a opção de forçar
+            if chk.get():
+                btn.configure(state="normal", text=text)
+            else:
+                btn.configure(state="disabled", text=f"✓ {text}")
+
+        chk.configure(command=refresh)
+        self._guards.append(refresh)
+        refresh()
+        return wrap
+
+    def _refresh_guards(self) -> None:
+        for fn in self._guards:
+            try:
+                fn()
+            except Exception:
+                pass
+
     # ---- Step 1 — Instalar tinc ----
 
     def _build_step_tinc(self) -> None:
@@ -783,10 +898,10 @@ class App(ctk.CTk):
         btn_row_t.pack(anchor="w", padx=14, pady=(2, 14))
         ctk.CTkButton(btn_row_t, text="Verificar", width=120,
                        command=self._refresh_tinc_step).pack(side="left", padx=4)
-        install_lbl = "Instalar automaticamente"
-        ctk.CTkButton(btn_row_t, text=install_lbl,
-                       fg_color=ACCENT, hover_color=ACCENT_HOVER,
-                       command=self.on_install_tinc).pack(side="left", padx=4)
+        self._make_guarded(
+            btn_row_t, text="Instalar automaticamente",
+            done_predicate=tinc_installed,
+            command=self.on_install_tinc).pack(side="left", padx=4)
 
         inst_card = self._card(frame)
         if IS_WINDOWS:
@@ -857,9 +972,10 @@ class App(ctk.CTk):
         btn_row_tap.pack(anchor="w", padx=14, pady=(2, 14))
         ctk.CTkButton(btn_row_tap, text="Verificar", width=120,
                        command=self._refresh_tap_step).pack(side="left", padx=4)
-        ctk.CTkButton(btn_row_tap, text="Instalar driver TAP",
-                       fg_color=ACCENT, hover_color=ACCENT_HOVER,
-                       command=self.on_install_tap).pack(side="left", padx=4)
+        self._make_guarded(
+            btn_row_tap, text="Instalar driver TAP",
+            done_predicate=check_tap_installed,
+            command=self.on_install_tap).pack(side="left", padx=4)
 
         inst_card = self._card(frame)
         ctk.CTkLabel(inst_card, text="Como instalar",
@@ -944,9 +1060,11 @@ class App(ctk.CTk):
 
         btn_row = ctk.CTkFrame(form_card, fg_color="transparent")
         btn_row.pack(anchor="w", padx=14, pady=(2, 14))
-        ctk.CTkButton(btn_row, text="Criar ficheiros + gerar chaves",
-                       fg_color=ACCENT, hover_color=ACCENT_HOVER,
-                       command=self.on_setup_files).pack(side="left", padx=4)
+        self._make_guarded(
+            btn_row, text="Criar ficheiros + gerar chaves",
+            done_predicate=lambda: step_config_done(
+                self.settings.player_name, self.settings.setup_done),
+            command=self.on_setup_files).pack(side="left", padx=4)
         if IS_WINDOWS:
             ctk.CTkButton(btn_row, text="Regras de firewall",
                            command=self.on_firewall).pack(side="left", padx=4)
@@ -1138,8 +1256,12 @@ class App(ctk.CTk):
         self.ping_label = ctk.CTkLabel(ping_card, text="Ping ao servidor: —",
                                         font=ctk.CTkFont(size=12))
         self.ping_label.pack(anchor="w", padx=18, pady=(12, 4))
-        ctk.CTkButton(ping_card, text="Testar ping agora", width=150,
-                       command=self.on_ping).pack(anchor="w", padx=18, pady=(0, 12))
+        ping_btns = ctk.CTkFrame(ping_card, fg_color="transparent")
+        ping_btns.pack(anchor="w", padx=14, pady=(0, 12))
+        ctk.CTkButton(ping_btns, text="Testar ping agora", width=150,
+                       command=self.on_ping).pack(side="left", padx=4)
+        ctk.CTkButton(ping_btns, text="Diagnosticar ligação", width=170,
+                       command=self.on_diagnose).pack(side="left", padx=4)
 
         tips_card = self._card(frame)
         ctk.CTkLabel(tips_card, text="Dicas",
@@ -1173,6 +1295,7 @@ class App(ctk.CTk):
         self._update_sidebar()
         self._update_nav_bar()
         self._refresh_current_step()
+        self._refresh_guards()
 
     def next_step(self) -> None:
         if self._current < len(self._steps) - 1:
@@ -1309,6 +1432,7 @@ class App(ctk.CTk):
                     self.after(0, lambda err=e: self._log(f"Não consegui ler o host file: {err}"))
                 self.after(0, self._refresh_config_step)
                 self.after(0, self._update_sidebar)
+                self.after(0, self._refresh_guards)
             except Exception as e:
                 self.after(0, lambda err=e: messagebox.showerror(APP_TITLE, str(err)))
 
@@ -1357,6 +1481,7 @@ class App(ctk.CTk):
             if ok:
                 self.after(0, lambda: self._log("tinc instalado com sucesso."))
                 self.after(0, self._refresh_tinc_step)
+                self.after(0, self._refresh_guards)
             else:
                 self.after(0, lambda: self._log("⚠  Instalação não concluída — vê o log."))
         threading.Thread(target=worker, daemon=True).start()
@@ -1370,6 +1495,7 @@ class App(ctk.CTk):
                     self.after(0, lambda m=msg: self._log(m))
                 self.after(0, lambda: self._log("Driver TAP instalado." if ok else "⚠  Falha — vê o log."))
                 self.after(0, self._refresh_tap_step)
+                self.after(0, self._refresh_guards)
             except Exception as e:
                 self.after(0, lambda e=e: self._log(f"Erro ao instalar TAP: {e}"))
         threading.Thread(target=worker, daemon=True).start()
@@ -1490,7 +1616,22 @@ class App(ctk.CTk):
                 if log2:
                     self.after(0, lambda l=log2: self._log(l))
                 self.after(0, lambda: self._log("IP TAP definido" if ok2 else "Falha a definir IP TAP"))
+                # Sem isto, a TAP fica como rede 'Pública' e o Windows bloqueia o
+                # tráfego de entrada (ping e descoberta LAN do jogo). Idempotente.
+                okf, _ = add_windows_firewall_rules()
+                self.after(0, lambda f=okf: self._log(
+                    "Regras de firewall aplicadas ✓" if f
+                    else "Aviso: não consegui aplicar todas as regras de firewall"))
             time.sleep(2)
+            # O serviço pode estar a correr sem túnel; confirmar com ping e, se
+            # falhar, despejar o diagnóstico do tinc para o log ser útil.
+            reachable = ping_server()
+            self.after(0, lambda r=reachable: self._log(
+                "Servidor alcançável ✓" if r
+                else "Servidor NÃO alcançável — a recolher diagnóstico…"))
+            if not reachable:
+                diag = tinc_diagnostics()
+                self.after(0, lambda d=diag: self._log(d))
             self.after(0, self._refresh_status_async)
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1512,6 +1653,13 @@ class App(ctk.CTk):
                 self.after(0, lambda: self.ping_label.configure(
                     text=f"Ping ao servidor: {'OK ✓' if ok else 'sem resposta ✗'}"))
             self.after(0, lambda: self._log(f"Ping {SERVER_VPN_IP}: {'OK' if ok else 'falhou'}"))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_diagnose(self) -> None:
+        def worker() -> None:
+            self.after(0, lambda: self._log("A recolher diagnóstico do tinc…"))
+            diag = tinc_diagnostics()
+            self.after(0, lambda d=diag: self._log(d))
         threading.Thread(target=worker, daemon=True).start()
 
 
