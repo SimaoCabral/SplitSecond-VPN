@@ -243,6 +243,10 @@ def read_text_maybe_sudo(path: Path) -> str:
 
 def write_tinc_conf(player_name: str) -> None:
     content = f"Name = {player_name}\nMode = switch\nConnectTo = server\n"
+    if IS_WINDOWS:
+        tap_name = find_windows_tap_name()
+        if tap_name:
+            content += f"Interface = {tap_name}\n"
     write_text_maybe_sudo(tinc_dir() / "tinc.conf", content)
 
 
@@ -336,32 +340,34 @@ def stop_tinc() -> tuple[bool, str]:
     return rc in (0, 1), (out + err).strip()
 
 
-def find_windows_tap_name() -> str:
-    """Nome da ligação do adaptador TAP-Windows (ex.: 'Ethernet 2'), ou '' se não existir.
-
-    O instalador do TAP cria o dispositivo 'tap0901' mas a *ligação* fica com um
-    nome automático ('Ethernet 2', etc.). Detectamos pela descrição do driver
-    ('TAP-Windows Adapter V9') em vez de assumir que se chama 'tap0901'.
-    """
+def _find_all_windows_tap_names() -> list[str]:
+    """Lista todos os adaptadores TAP-Windows encontrados no sistema."""
     if not IS_WINDOWS:
-        return ""
-    # getmac é nativo e rápido; a coluna 'Network Adapter' tem a descrição do driver.
+        return []
+    names: list[str] = []
     rc, out, _ = run_cmd(["getmac", "/v", "/fo", "csv"], timeout=15)
     if rc == 0 and out.strip():
         try:
             for row in csv.reader(out.splitlines()):
                 if len(row) >= 2 and "tap-win" in row[1].lower():
-                    return row[0].strip()
+                    names.append(row[0].strip())
         except Exception:
             pass
-    # Fallback: Get-NetAdapter apanha também adaptadores desligados (sem media).
+    if names:
+        return names
     ps = ("Get-NetAdapter | Where-Object { $_.InterfaceDescription -like '*TAP-Win*' }"
-          " | Select-Object -First 1 -ExpandProperty Name")
+          " | Select-Object -ExpandProperty Name")
     rc, out, _ = run_cmd(
         ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], timeout=20)
     if rc == 0 and out.strip():
-        return out.strip().splitlines()[0].strip()
-    return ""
+        return [n.strip() for n in out.strip().splitlines() if n.strip()]
+    return []
+
+
+def find_windows_tap_name() -> str:
+    """Nome da ligação do primeiro adaptador TAP-Windows, ou '' se não existir."""
+    names = _find_all_windows_tap_names()
+    return names[0] if names else ""
 
 
 def set_windows_tap_ip(ip: str) -> tuple[bool, str]:
@@ -585,6 +591,8 @@ def install_tap_driver() -> tuple[bool, str]:
     """Instala o driver TAP no Windows (requer modo administrador)."""
     if not IS_WINDOWS:
         return True, ""
+    if find_windows_tap_name():
+        return True, "Driver TAP já instalado — a saltar."
     base = Path(r"C:\Program Files\tinc\tap-win64")
     tapinstall = base / "tapinstall.exe"
     inf = base / "OemWin2k.inf"
@@ -1012,9 +1020,18 @@ class App(ctk.CTk):
     def _refresh_tap_step(self) -> None:
         def worker() -> None:
             try:
-                ok = check_tap_installed()
-                msg = "✓  Adaptador TAP encontrado." if ok else "✗  Adaptador TAP não encontrado."
-                color = OK_COLOR if ok else BAD_COLOR
+                names = _find_all_windows_tap_names()
+                if not names:
+                    msg = "✗  Adaptador TAP não encontrado."
+                    color = BAD_COLOR
+                elif len(names) > 1:
+                    msg = (f"⚠  {len(names)} adaptadores TAP encontrados: {', '.join(names)}\n"
+                           "   Devias ter apenas 1. Remove os extras em:\n"
+                           "   Gestor de Dispositivos → Adaptadores de rede → TAP-Windows → Desinstalar")
+                    color = WARN_COLOR
+                else:
+                    msg = f"✓  Adaptador TAP encontrado: {names[0]}"
+                    color = OK_COLOR
                 self.after(0, lambda: self.tap_status_lbl.configure(text=msg, text_color=color))
                 self.after(0, self._update_sidebar)
             except Exception as e:
@@ -1612,17 +1629,16 @@ class App(ctk.CTk):
                 self.after(0, lambda: messagebox.showerror(APP_TITLE, "tinc não arrancou. Vê o log."))
                 return
             if IS_WINDOWS:
+                time.sleep(3)
                 ok2, log2 = set_windows_tap_ip(self.settings.vpn_ip)
                 if log2:
                     self.after(0, lambda l=log2: self._log(l))
                 self.after(0, lambda: self._log("IP TAP definido" if ok2 else "Falha a definir IP TAP"))
-                # Sem isto, a TAP fica como rede 'Pública' e o Windows bloqueia o
-                # tráfego de entrada (ping e descoberta LAN do jogo). Idempotente.
                 okf, _ = add_windows_firewall_rules()
                 self.after(0, lambda f=okf: self._log(
                     "Regras de firewall aplicadas ✓" if f
                     else "Aviso: não consegui aplicar todas as regras de firewall"))
-            time.sleep(2)
+            time.sleep(3)
             # O serviço pode estar a correr sem túnel; confirmar com ping e, se
             # falhar, despejar o diagnóstico do tinc para o log ser útil.
             reachable = ping_server()
