@@ -36,7 +36,7 @@ VPN_CIDR_BITS = 24
 TINC_PORT = 11655
 
 APP_TITLE = "Split/Second VPN"
-APP_VERSION = "1.0.7"
+APP_VERSION = "1.0.8"
 
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX = platform.system() == "Linux"
@@ -70,6 +70,13 @@ def config_dir() -> Path:
 
 def config_file() -> Path:
     return config_dir() / "settings.json"
+
+
+def log_file_path() -> Path:
+    """Ficheiro onde o painel de log da app é também guardado, para sobreviver
+    ao fecho da janela. Linux: ~/.config/splitsecond-vpn/session.log;
+    Windows: %APPDATA%\\SplitSecondVPN\\session.log."""
+    return config_dir() / "session.log"
 
 
 # ----------------------------- elevation -----------------------------
@@ -432,9 +439,15 @@ def start_tinc() -> tuple[bool, str]:
         return rc == 0, (out + err).strip()
     sp = sudo_prefix()
     # Linux: arranque limpo + arranque num único pkexec para minimizar diálogos.
+    # Usar o '-k' do próprio tincd (mata via pidfile) em vez de pkill: o pkill
+    # com '-f tincd.*splitsecond' apanhava o PRÓPRIO bash wrapper (a sua linha de
+    # comando contém esse padrão) e matava o script antes de arrancar o tincd —
+    # nada ficava a correr. O '-k' não tem esse problema e funciona no tinc 1.0/1.1.
+    tb = shlex.quote(tincd_binary())
     shell = (
-        f"pkill -f 'tincd.*{NETWORK_NAME}' 2>/dev/null || true; "
-        f"{shlex.quote(tincd_binary())} -n {NETWORK_NAME}"
+        f"{tb} -n {NETWORK_NAME} -k 2>/dev/null || true; "
+        "sleep 1; "
+        f"{tb} -n {NETWORK_NAME}"
     )
     rc, out, err = run_cmd(sp + ["/bin/bash", "-c", shell], timeout=20)
     return rc == 0, (out + err).strip()
@@ -752,7 +765,9 @@ class App(ctk.CTk):
         self._guards: list = []  # refresh callbacks dos botões "feito → bloqueado"
 
         self._build_ui()
+        self._log("─" * 20 + " nova sessão " + "─" * 20)
         self._log(f"{APP_TITLE} {APP_VERSION} — {platform.system()} {platform.release()}")
+        self._log(f"Log guardado em: {log_file_path()}")
         if not tinc_installed():
             self._log("⚠  tinc não instalado nesta máquina.")
         self.after(150, self._auto_detect_step)
@@ -1448,10 +1463,18 @@ class App(ctk.CTk):
     # ------------------------------------------------------------------ helpers
 
     def _log(self, msg: str) -> None:
+        line = f"[{time.strftime('%H:%M:%S')}] {msg}"
         self.log_box.configure(state="normal")
-        self.log_box.insert("end", f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+        self.log_box.insert("end", line + "\n")
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
+        # Persistir em ficheiro: o painel da app é só memória e perde-se ao
+        # fechar. Best-effort — nunca falhar o log por causa do ficheiro.
+        try:
+            with open(log_file_path(), "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
 
     def _info_text(self) -> str:
         s = self.settings
