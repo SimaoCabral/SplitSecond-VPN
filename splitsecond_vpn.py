@@ -34,7 +34,7 @@ VPN_CIDR_BITS = 24
 TINC_PORT = 11655
 
 APP_TITLE = "Split/Second VPN"
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.6"
 
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX = platform.system() == "Linux"
@@ -260,15 +260,41 @@ def write_host_self(player_name: str, last_octet: int, pubkey_block: str = "") -
 def write_linux_scripts(last_octet: int) -> None:
     if not IS_LINUX:
         return
+    # A interface VPN é uma rede de confiança: abrimos o firewall nela para que
+    # a descoberta LAN do Split/Second (broadcast UDP 9100) e o resto do tráfego
+    # de entrada não sejam descartados. Sem isto, os jogadores não se vêem mesmo
+    # com o túnel a funcionar. Detectamos o gestor de firewall activo; tudo é em
+    # runtime (não persiste após reboot) e revertido no tinc-down.
+    fw_up = (
+        'if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then\n'
+        '    firewall-cmd --zone=trusted --add-interface="$INTERFACE" >/dev/null 2>&1\n'
+        'elif command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi active; then\n'
+        '    ufw allow in on "$INTERFACE" >/dev/null 2>&1\n'
+        'elif command -v iptables >/dev/null 2>&1; then\n'
+        '    iptables -C INPUT -i "$INTERFACE" -j ACCEPT 2>/dev/null || \\\n'
+        '        iptables -I INPUT -i "$INTERFACE" -j ACCEPT 2>/dev/null\n'
+        'fi\n'
+    )
+    fw_down = (
+        'if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then\n'
+        '    firewall-cmd --zone=trusted --remove-interface="$INTERFACE" >/dev/null 2>&1\n'
+        'elif command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi active; then\n'
+        '    ufw delete allow in on "$INTERFACE" >/dev/null 2>&1\n'
+        'elif command -v iptables >/dev/null 2>&1; then\n'
+        '    iptables -D INPUT -i "$INTERFACE" -j ACCEPT 2>/dev/null || true\n'
+        'fi\n'
+    )
     up = (
         "#!/bin/bash\n"
-        "ip link set $INTERFACE up\n"
-        f"ip addr add 10.20.0.{last_octet}/{VPN_CIDR_BITS} dev $INTERFACE\n"
+        'ip link set "$INTERFACE" up\n'
+        f'ip addr add 10.20.0.{last_octet}/{VPN_CIDR_BITS} dev "$INTERFACE"\n'
+        + fw_up
     )
     down = (
         "#!/bin/bash\n"
-        f"ip addr del 10.20.0.{last_octet}/{VPN_CIDR_BITS} dev $INTERFACE || true\n"
-        "ip link set $INTERFACE down || true\n"
+        + fw_down
+        + f'ip addr del 10.20.0.{last_octet}/{VPN_CIDR_BITS} dev "$INTERFACE" || true\n'
+        'ip link set "$INTERFACE" down || true\n'
     )
     write_text_maybe_sudo(tinc_dir() / "tinc-up", up, executable=True)
     write_text_maybe_sudo(tinc_dir() / "tinc-down", down, executable=True)
@@ -1620,6 +1646,15 @@ class App(ctk.CTk):
                         self.after(0, lambda: self._log(f"hosts/server actualizado com IP {ip}"))
                 except Exception as e:
                     self.after(0, lambda err=e: self._log(f"Aviso: auto-update falhou ({err})"))
+
+            if IS_LINUX:
+                # Reescrever os scripts garante que utilizadores antigos (com um
+                # tinc-up sem as regras de firewall) recebem a correcção sem ter
+                # de repetir a configuração.
+                try:
+                    write_linux_scripts(self.settings.last_octet)
+                except Exception as e:
+                    self.after(0, lambda err=e: self._log(f"Aviso: não consegui actualizar tinc-up/down ({err})"))
 
             self.after(0, lambda: self._log("A iniciar tinc…"))
             ok, log = start_tinc()
