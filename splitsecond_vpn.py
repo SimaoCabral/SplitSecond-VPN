@@ -12,9 +12,11 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -34,7 +36,7 @@ VPN_CIDR_BITS = 24
 TINC_PORT = 11655
 
 APP_TITLE = "Split/Second VPN"
-APP_VERSION = "1.0.6"
+APP_VERSION = "1.0.7"
 
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX = platform.system() == "Linux"
@@ -213,17 +215,23 @@ def write_text_maybe_sudo(path: Path, content: str, *, executable: bool = False)
     sp = sudo_prefix()
     if not sp:
         raise PermissionError(f"Sem privilégios para escrever em {path}")
-    run_cmd(sp + ["mkdir", "-p", str(path.parent)], check=True)
-    proc = subprocess.run(
-        sp + ["tee", str(path)],
-        input=content.encode("utf-8"),
-        capture_output=True,
-        check=False,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(f"tee {path}: {proc.stderr.decode(errors='replace')}")
-    if executable:
-        run_cmd(sp + ["chmod", "+x", str(path)], check=True)
+    # Escreve para ficheiro temporário (sem elevação) e depois copia com um único
+    # pkexec — evita 3 diálogos separados (mkdir + tee + chmod) por ficheiro.
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", suffix=".tmp", delete=False
+    ) as tf:
+        tf.write(content)
+        tmp = Path(tf.name)
+    try:
+        mode = "755" if executable else "644"
+        shell = (
+            f"mkdir -p {shlex.quote(str(path.parent))} && "
+            f"cp {shlex.quote(str(tmp))} {shlex.quote(str(path))} && "
+            f"chmod {mode} {shlex.quote(str(path))}"
+        )
+        run_cmd(sp + ["/bin/bash", "-c", shell], check=True)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def read_text_maybe_sudo(path: Path) -> str:
@@ -265,23 +273,48 @@ def write_linux_scripts(last_octet: int) -> None:
     # de entrada não sejam descartados. Sem isto, os jogadores não se vêem mesmo
     # com o túnel a funcionar. Detectamos o gestor de firewall activo; tudo é em
     # runtime (não persiste após reboot) e revertido no tinc-down.
+    # Registamos o resultado num ficheiro temporário para o app poder mostrar
+    # no log qual o gestor detectado e se os comandos tiveram sucesso.
     fw_up = (
+        '_FWLOG=/tmp/splitsecond-vpn-fw.log\n'
+        '{\n'
+        'printf "interface=%s\\n" "$INTERFACE"\n'
+        # Encaminhar o broadcast limitado (255.255.255.255) para a interface VPN.
+        # Por omissão o Linux envia-o pela rota predefinida (placa física), por
+        # isso o broadcast de descoberta do jogo nunca entra no túnel. Esta rota
+        # força-o a sair pela VPN com o IP 10.20.0.x.
+        'ip route replace table local broadcast 255.255.255.255 dev "$INTERFACE" scope link 2>&1 && echo "bcast_route=ok" || '
+        '{ ip route replace 255.255.255.255/32 dev "$INTERFACE" 2>&1 && echo "bcast_route=ok(simples)" || echo "bcast_route=falhou"; }\n'
         'if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then\n'
-        '    firewall-cmd --zone=trusted --add-interface="$INTERFACE" >/dev/null 2>&1\n'
+        '    echo "manager=firewalld"\n'
+        # Zona trusted na interface (principal) + regra de subrede (alternativa se
+        # o NetworkManager mudar a zona entretanto).
+        '    firewall-cmd --zone=trusted --add-interface="$INTERFACE" 2>&1 && echo "iface_zone=ok" || echo "iface_zone=falhou"\n'
+        '    firewall-cmd --add-rich-rule=\'rule family="ipv4" source address="10.20.0.0/24" accept\' 2>&1 && echo "subnet_rule=ok" || echo "subnet_rule=falhou"\n'
         'elif command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi active; then\n'
-        '    ufw allow in on "$INTERFACE" >/dev/null 2>&1\n'
+        '    echo "manager=ufw"\n'
+        '    ufw allow from 10.20.0.0/24 2>&1 && echo "subnet_rule=ok" || echo "subnet_rule=falhou"\n'
         'elif command -v iptables >/dev/null 2>&1; then\n'
-        '    iptables -C INPUT -i "$INTERFACE" -j ACCEPT 2>/dev/null || \\\n'
-        '        iptables -I INPUT -i "$INTERFACE" -j ACCEPT 2>/dev/null\n'
+        '    echo "manager=iptables"\n'
+        '    iptables -C INPUT -i "$INTERFACE" -j ACCEPT 2>/dev/null || iptables -I INPUT -i "$INTERFACE" -j ACCEPT 2>&1 && echo "iface_rule=ok" || echo "iface_rule=falhou"\n'
+        '    iptables -C INPUT -s 10.20.0.0/24 -j ACCEPT 2>/dev/null || iptables -I INPUT -s 10.20.0.0/24 -j ACCEPT 2>&1 && echo "subnet_rule=ok" || echo "subnet_rule=falhou"\n'
+        'else\n'
+        '    echo "manager=nenhum"\n'
         'fi\n'
+        '} > "$_FWLOG" 2>&1\n'
     )
     fw_down = (
+        'rm -f /tmp/splitsecond-vpn-fw.log\n'
+        'ip route del table local broadcast 255.255.255.255 dev "$INTERFACE" 2>/dev/null || '
+        'ip route del 255.255.255.255/32 dev "$INTERFACE" 2>/dev/null || true\n'
         'if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then\n'
-        '    firewall-cmd --zone=trusted --remove-interface="$INTERFACE" >/dev/null 2>&1\n'
+        '    firewall-cmd --zone=trusted --remove-interface="$INTERFACE" >/dev/null 2>&1 || true\n'
+        '    firewall-cmd --remove-rich-rule=\'rule family="ipv4" source address="10.20.0.0/24" accept\' >/dev/null 2>&1 || true\n'
         'elif command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi active; then\n'
-        '    ufw delete allow in on "$INTERFACE" >/dev/null 2>&1\n'
+        '    ufw delete allow from 10.20.0.0/24 >/dev/null 2>&1 || true\n'
         'elif command -v iptables >/dev/null 2>&1; then\n'
         '    iptables -D INPUT -i "$INTERFACE" -j ACCEPT 2>/dev/null || true\n'
+        '    iptables -D INPUT -s 10.20.0.0/24 -j ACCEPT 2>/dev/null || true\n'
         'fi\n'
     )
     up = (
@@ -298,6 +331,55 @@ def write_linux_scripts(last_octet: int) -> None:
     )
     write_text_maybe_sudo(tinc_dir() / "tinc-up", up, executable=True)
     write_text_maybe_sudo(tinc_dir() / "tinc-down", down, executable=True)
+
+
+def fw_log_path() -> Path:
+    """Ficheiro onde o tinc-up regista a preparação de rede (gestor, rota,
+    regras). Lido pela app após ligar para mostrar o diagnóstico."""
+    if IS_WINDOWS:
+        return tinc_dir() / "fw.log"
+    return Path("/tmp/splitsecond-vpn-fw.log")
+
+
+def write_windows_scripts(ip: str) -> None:
+    """Escreve tinc-up.bat/tinc-down.bat — o equivalente Windows aos scripts
+    Linux. O tinc corre-os ao subir/descer a interface, por isso TODA a
+    preparação de rede (IP, métrica, firewall) acontece sempre que a VPN liga,
+    independentemente de ter sido a GUI ou o serviço a arrancar o tinc.
+
+    Toda a configuração de rede do Windows vive aqui — é a única fonte. As
+    regras de firewall vêm de _FIREWALL_RULES (partilhadas com o botão manual).
+    """
+    if not IS_WINDOWS:
+        return
+    # Nome resolvido agora (consistente com Interface= no tinc.conf); se falhar,
+    # cai para %INTERFACE%, que o tinc define para o adaptador em uso.
+    iface = find_windows_tap_name() or "%INTERFACE%"
+    log = str(fw_log_path())
+    up_lines = [
+        "@echo off",
+        # Parênteses isolam o nome do '>' : um nome terminado em dígito (ex.:
+        # "Ethernet 2") colado ao '>' seria lido como redireccionamento de stderr.
+        f'(echo interface={iface})> "{log}"',
+        # IP estático na TAP.
+        f'netsh interface ip set address "{iface}" static {ip} {VPN_SUBNET_MASK} >> "{log}" 2>&1',
+        # Métrica baixa: o Windows passa a escolher a VPN como saída do broadcast
+        # limitado (UDP 255.255.255.255 :9100) da descoberta LAN do jogo. A TAP
+        # não tem gateway, por isso a internet continua pela placa física.
+        f'netsh interface ipv4 set interface "{iface}" metric=1 >> "{log}" 2>&1',
+    ]
+    down_lines = ["@echo off"]
+    for rname, spec in _FIREWALL_RULES:
+        specstr = " ".join(spec)
+        # Idempotente: apagar antes de adicionar evita duplicados acumulados.
+        up_lines.append(f'netsh advfirewall firewall delete rule name="{rname}" >nul 2>&1')
+        up_lines.append(
+            f'netsh advfirewall firewall add rule name="{rname}" dir=in action=allow '
+            f'{specstr} >> "{log}" 2>&1')
+        down_lines.append(f'netsh advfirewall firewall delete rule name="{rname}" >nul 2>&1')
+    # \n é convertido em \r\n pela escrita em modo texto no Windows.
+    write_text_maybe_sudo(tinc_dir() / "tinc-up.bat", "\n".join(up_lines) + "\n")
+    write_text_maybe_sudo(tinc_dir() / "tinc-down.bat", "\n".join(down_lines) + "\n")
 
 
 def generate_keys() -> tuple[bool, str]:
@@ -349,9 +431,12 @@ def start_tinc() -> tuple[bool, str]:
             run_cmd(["sc", "config", WINDOWS_SERVICE_NAME, "start=", "demand"], timeout=10)
         return rc == 0, (out + err).strip()
     sp = sudo_prefix()
-    # Linux: também arranque limpo, para recarregar config/host files novos.
-    run_cmd(sp + ["pkill", "-f", f"tincd.*{NETWORK_NAME}"], timeout=10)
-    rc, out, err = run_cmd(sp + [tincd_binary(), "-n", NETWORK_NAME], timeout=20)
+    # Linux: arranque limpo + arranque num único pkexec para minimizar diálogos.
+    shell = (
+        f"pkill -f 'tincd.*{NETWORK_NAME}' 2>/dev/null || true; "
+        f"{shlex.quote(tincd_binary())} -n {NETWORK_NAME}"
+    )
+    rc, out, err = run_cmd(sp + ["/bin/bash", "-c", shell], timeout=20)
     return rc == 0, (out + err).strip()
 
 
@@ -394,23 +479,6 @@ def find_windows_tap_name() -> str:
     """Nome da ligação do primeiro adaptador TAP-Windows, ou '' se não existir."""
     names = _find_all_windows_tap_names()
     return names[0] if names else ""
-
-
-def set_windows_tap_ip(ip: str) -> tuple[bool, str]:
-    if not IS_WINDOWS:
-        return True, ""
-    name = find_windows_tap_name()
-    if not name:
-        return False, ("Adaptador TAP não encontrado — instala o driver TAP (Passo 2) "
-                       "e tenta de novo.")
-    rc, out, err = run_cmd(
-        ["netsh", "interface", "ip", "set", "address", name, "static", ip, VPN_SUBNET_MASK],
-        timeout=30,
-    )
-    msg = (out + err).strip()
-    if rc != 0:
-        return False, msg or f"netsh falhou (código {rc}) ao configurar '{name}'."
-    return True, f"IP {ip} definido em '{name}'."
 
 
 # (nome da regra, spec extra). dir=in/action=allow são comuns a todas.
@@ -1460,7 +1528,10 @@ class App(ctk.CTk):
                 ensure_tinc_dirs()
                 write_tinc_conf(self.settings.player_name)
                 write_host_self(self.settings.player_name, self.settings.last_octet)
-                write_linux_scripts(self.settings.last_octet)
+                if IS_LINUX:
+                    write_linux_scripts(self.settings.last_octet)
+                elif IS_WINDOWS:
+                    write_windows_scripts(self.settings.vpn_ip)
                 self.after(0, lambda: self._log("Ficheiros criados em " + str(tinc_dir())))
                 ok, out = generate_keys()
                 self.after(0, lambda: self._log(
@@ -1647,14 +1718,18 @@ class App(ctk.CTk):
                 except Exception as e:
                     self.after(0, lambda err=e: self._log(f"Aviso: auto-update falhou ({err})"))
 
-            if IS_LINUX:
-                # Reescrever os scripts garante que utilizadores antigos (com um
-                # tinc-up sem as regras de firewall) recebem a correcção sem ter
-                # de repetir a configuração.
-                try:
+            # Reescrever os scripts antes de arrancar garante que utilizadores
+            # antigos recebem a correcção sem repetir a configuração. Toda a
+            # preparação de rede (IP, métrica/rota de broadcast, firewall) vive
+            # nestes scripts que o tinc corre ao subir a interface — igual nos
+            # dois SO, por isso nenhum comando fica por executar.
+            try:
+                if IS_LINUX:
                     write_linux_scripts(self.settings.last_octet)
-                except Exception as e:
-                    self.after(0, lambda err=e: self._log(f"Aviso: não consegui actualizar tinc-up/down ({err})"))
+                elif IS_WINDOWS:
+                    write_windows_scripts(self.settings.vpn_ip)
+            except Exception as e:
+                self.after(0, lambda err=e: self._log(f"Aviso: não consegui actualizar tinc-up/down ({err})"))
 
             self.after(0, lambda: self._log("A iniciar tinc…"))
             ok, log = start_tinc()
@@ -1663,17 +1738,9 @@ class App(ctk.CTk):
             if not ok:
                 self.after(0, lambda: messagebox.showerror(APP_TITLE, "tinc não arrancou. Vê o log."))
                 return
-            if IS_WINDOWS:
-                time.sleep(3)
-                ok2, log2 = set_windows_tap_ip(self.settings.vpn_ip)
-                if log2:
-                    self.after(0, lambda l=log2: self._log(l))
-                self.after(0, lambda: self._log("IP TAP definido" if ok2 else "Falha a definir IP TAP"))
-                okf, _ = add_windows_firewall_rules()
-                self.after(0, lambda f=okf: self._log(
-                    "Regras de firewall aplicadas ✓" if f
-                    else "Aviso: não consegui aplicar todas as regras de firewall"))
-            time.sleep(3)
+            # No Windows o serviço arranca o tincd de forma assíncrona; dar tempo
+            # para a interface subir e o tinc-up.bat correr antes de testar.
+            time.sleep(5 if IS_WINDOWS else 3)
             # O serviço pode estar a correr sem túnel; confirmar com ping e, se
             # falhar, despejar o diagnóstico do tinc para o log ser útil.
             reachable = ping_server()
@@ -1683,6 +1750,17 @@ class App(ctk.CTk):
             if not reachable:
                 diag = tinc_diagnostics()
                 self.after(0, lambda d=diag: self._log(d))
+            # Mostrar o log de preparação de rede escrito pelo tinc-up (gestor,
+            # rota de broadcast, regras). Se faltar, o tinc-up não correu.
+            try:
+                txt = fw_log_path().read_text(errors="replace").strip()
+                self.after(0, lambda t=txt: self._log(f"Rede VPN:\n{t}"))
+            except FileNotFoundError:
+                self.after(0, lambda: self._log(
+                    "Aviso: o tinc-up não escreveu o log de rede — o script pode ser antigo "
+                    "ou o tinc não o executou. Liga/desliga para forçar a actualização."))
+            except Exception as e:
+                self.after(0, lambda err=e: self._log(f"Aviso: não consegui ler o log de rede ({err})"))
             self.after(0, self._refresh_status_async)
 
         threading.Thread(target=worker, daemon=True).start()
